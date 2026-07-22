@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>谷を掘って転がす — Valley Roll</title>
+<style>
+  html, body {
+    margin: 0; height: 100%;
+    background: #0e1418;
+    color: #cfe4ea;
+    font-family: -apple-system, "Segoe UI", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+    overflow: hidden;
+  }
+  #wrap {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    gap: 12px;
+  }
+  #stage { position: relative; }
+  canvas { display: block; border-radius: 14px; box-shadow: 0 18px 60px rgba(0,0,0,.55); cursor: none; }
+  #hud {
+    position: absolute; left: 16px; top: 14px;
+    font-size: 13px; line-height: 1.5; letter-spacing: .02em;
+    text-shadow: 0 1px 3px rgba(0,0,0,.7); pointer-events: none;
+    opacity: .9;
+  }
+  #hud b { color: #ffe08a; }
+  #tip {
+    font-size: 13px; opacity: .6; letter-spacing: .03em;
+  }
+  #banner {
+    position: absolute; inset: 0;
+    display: none; align-items: center; justify-content: center;
+    flex-direction: column; gap: 10px;
+    background: rgba(6,10,13,.55); backdrop-filter: blur(2px);
+    border-radius: 14px; text-align: center;
+  }
+  #banner h1 { margin: 0; font-size: 40px; letter-spacing: .06em; }
+  #banner p { margin: 0; font-size: 15px; opacity: .85; }
+  #banner.win h1 { color: #9be89b; text-shadow: 0 0 22px rgba(120,240,140,.5); }
+  #banner.lose h1 { color: #ff9a8a; text-shadow: 0 0 22px rgba(255,120,100,.4); }
+  kbd {
+    background: #23323a; border: 1px solid #3a4c56; border-radius: 5px;
+    padding: 1px 7px; font-size: 12px; color: #dfeef4;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="stage">
+    <canvas id="c" width="900" height="600"></canvas>
+    <div id="hud"></div>
+    <div id="banner"><h1></h1><p></p></div>
+  </div>
+  <div id="tip">マウスを押している間だけ地面が窪み、球はそこへ引き寄せられる。 &nbsp;/&nbsp; <kbd>R</kbd> やり直し</div>
+</div>
+<script>
+"use strict";
+(() => {
+  const cv = document.getElementById('c');
+  const ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const hud = document.getElementById('hud');
+  const banner = document.getElementById('banner');
+
+  // ---- Landscape definition -------------------------------------------------
+  // A "free energy landscape": height field made of gentle background undulation
+  // plus two attractive basins (target + false pit). The ball rolls down the
+  // gradient. On its own it barely moves; the ONLY strong force the player can
+  // apply is the dent under the cursor while pressing.
+  // Each basin has a visual/core radius R and a finite force reach Rmax. Beyond
+  // Rmax the well exerts NO force — the plain is flat, so a resting ball far from
+  // any valley cannot be dragged in on its own. That flatness is what makes the
+  // dent the only thing that can move the ball.
+  const LEVEL = {
+    ballStart: { x: 150, y: 300 },
+    target:    { x: 470, y: 316, R: 92, Rmax: 150 },  // real valley — settle to win
+    falsePit:  { x: 712, y: 250, R: 70, Rmax: 118 },  // decoy valley — fall in, lose
+  };
+
+  // physics tuning (px, frames)
+  const K_TARGET = 0.00050;   // pull strength of the goal basin
+  const K_FALSE  = 0.00062;   // pull strength of the decoy pit
+  const K_DENT   = 0.00230;   // pull strength of the cursor dent (the only tool)
+  const R_DENT   = 168;       // reach of the dent
+  const K_BG     = 0.004;     // background undulation force (deliberately weak)
+  const FRICTION = 0.986;     // per-frame velocity decay
+  const BG_FREQ  = 0.0135;    // spatial frequency of the background waves
+  const MAXV     = 6.2;       // speed clamp so the well can't fling the ball
+
+  const state = {
+    ball: { x: 0, y: 0, vx: 0, vy: 0 },
+    mouse: { x: W/2, y: H/2, down: false, inside: false },
+    settleFrames: 0,
+    result: null,      // null | 'win' | 'lose'
+    winGlow: 0,
+    t: 0,
+  };
+
+  function reset() {
+    state.ball.x = LEVEL.ballStart.x;
+    state.ball.y = LEVEL.ballStart.y;
+    state.ball.vx = 0; state.ball.vy = 0;
+    state.settleFrames = 0;
+    state.result = null;
+    state.winGlow = 0;
+    banner.style.display = 'none';
+    banner.className = '';
+  }
+
+  // background height (for both physics gradient and visuals)
+  function bgHeight(x, y) {
+    return Math.sin(x * BG_FREQ) * Math.cos(y * BG_FREQ * 0.9)
+         + 0.5 * Math.sin((x + y) * BG_FREQ * 0.6 + 1.7);
+  }
+
+  // ---- Static landscape render (once) --------------------------------------
+  const land = document.createElement('canvas');
+  land.width = W; land.height = H;
+  const lctx = land.getContext('2d');
+
+  function paintLandscape() {
+    const img = lctx.createImageData(W, H);
+    const d = img.data;
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const h = bgHeight(x, y);            // roughly [-1.5, 1.5]
+        const shade = (h + 1.5) / 3;         // 0..1
+        // contour banding for the "energy landscape" look
+        const band = 0.5 + 0.5 * Math.cos(h * 7.5);
+        const l = 0.16 + 0.10 * shade + 0.05 * band;
+        const r = Math.round(255 * (l * 0.55));
+        const g = Math.round(255 * (l * 1.05));
+        const b = Math.round(255 * (l * 1.15));
+        const i = (y * W + x) * 4;
+        d[i] = r; d[i+1] = Math.min(255, g); d[i+2] = Math.min(255, b); d[i+3] = 255;
+      }
+    }
+    lctx.putImageData(img, 0, 0);
+
+    // target basin — a bright green dip with a soft rim
+    const t = LEVEL.target;
+    let grd = lctx.createRadialGradient(t.x, t.y, 4, t.x, t.y, t.R * 1.5);
+    grd.addColorStop(0.0, 'rgba(150,255,180,0.95)');
+    grd.addColorStop(0.35, 'rgba(70,200,130,0.55)');
+    grd.addColorStop(0.75, 'rgba(30,110,80,0.25)');
+    grd.addColorStop(1.0, 'rgba(30,110,80,0.0)');
+    lctx.globalCompositeOperation = 'lighter';
+    lctx.fillStyle = grd;
+    lctx.beginPath(); lctx.arc(t.x, t.y, t.R * 1.5, 0, 7); lctx.fill();
+    lctx.globalCompositeOperation = 'source-over';
+
+    // false pit — a dark hole with a warning rim
+    const f = LEVEL.falsePit;
+    grd = lctx.createRadialGradient(f.x, f.y, 2, f.x, f.y, f.R * 1.5);
+    grd.addColorStop(0.0, 'rgba(0,0,0,0.95)');
+    grd.addColorStop(0.45, 'rgba(10,4,8,0.8)');
+    grd.addColorStop(0.8, 'rgba(120,40,50,0.35)');
+    grd.addColorStop(1.0, 'rgba(120,40,50,0.0)');
+    lctx.fillStyle = grd;
+    lctx.beginPath(); lctx.arc(f.x, f.y, f.R * 1.5, 0, 7); lctx.fill();
+    // thin warning ring
+    lctx.strokeStyle = 'rgba(255,120,110,0.4)';
+    lctx.lineWidth = 2;
+    lctx.beginPath(); lctx.arc(f.x, f.y, f.R, 0, 7); lctx.stroke();
+  }
+  paintLandscape();
+
+  // ---- Physics --------------------------------------------------------------
+  // Compactly-supported attractive well. Height h(r) = -D*(1-(r/Rmax)^2)^2 for
+  // r<Rmax, else 0 (flat). Force = -grad(h) = -k*(1-(r/Rmax)^2)*(p-c), which is
+  // attractive inside Rmax and EXACTLY zero beyond it. Returns r^2.
+  function basinForce(px, py, c, k, reach, out) {
+    const dx = px - c.x, dy = py - c.y;
+    const r2 = dx*dx + dy*dy;
+    const Rm2 = reach * reach;
+    if (r2 >= Rm2) return r2;            // flat plain outside the well — no force
+    const w = 1 - r2 / Rm2;              // smoothly → 0 at the rim
+    out.x += -k * w * dx;
+    out.y += -k * w * dy;
+    return r2;
+  }
+
+  const F = { x: 0, y: 0 };
+  function step() {
+    state.t++;
+    const b = state.ball;
+    F.x = 0; F.y = 0;
+
+    // background undulation (weak) — analytic gradient of bgHeight
+    const gx = BG_FREQ * Math.cos(b.x * BG_FREQ) * Math.cos(b.y * BG_FREQ * 0.9)
+             + 0.5 * BG_FREQ * 0.6 * Math.cos((b.x + b.y) * BG_FREQ * 0.6 + 1.7);
+    const gy = -BG_FREQ * 0.9 * Math.sin(b.x * BG_FREQ) * Math.sin(b.y * BG_FREQ * 0.9)
+             + 0.5 * BG_FREQ * 0.6 * Math.cos((b.x + b.y) * BG_FREQ * 0.6 + 1.7);
+    F.x -= K_BG * gx; F.y -= K_BG * gy;
+
+    // basins
+    const rt2 = basinForce(b.x, b.y, LEVEL.target, K_TARGET, LEVEL.target.Rmax, F);
+    const rf2 = basinForce(b.x, b.y, LEVEL.falsePit, K_FALSE, LEVEL.falsePit.Rmax, F);
+
+    // the dent (only control the player has)
+    if (state.mouse.down && state.mouse.inside && !state.result) {
+      const dc = { x: state.mouse.x, y: state.mouse.y };
+      basinForce(b.x, b.y, dc, K_DENT, R_DENT, F);
+    }
+
+    if (!state.result) {
+      b.vx = (b.vx + F.x) * FRICTION;
+      b.vy = (b.vy + F.y) * FRICTION;
+      const sp = Math.hypot(b.vx, b.vy);
+      if (sp > MAXV) { b.vx *= MAXV / sp; b.vy *= MAXV / sp; }
+      b.x += b.vx; b.y += b.vy;
+
+      // walls (soft)
+      const m = 14;
+      if (b.x < m) { b.x = m; b.vx = Math.abs(b.vx) * 0.4; }
+      if (b.x > W - m) { b.x = W - m; b.vx = -Math.abs(b.vx) * 0.4; }
+      if (b.y < m) { b.y = m; b.vy = Math.abs(b.vy) * 0.4; }
+      if (b.y > H - m) { b.y = H - m; b.vy = -Math.abs(b.vy) * 0.4; }
+
+      const speed = Math.hypot(b.vx, b.vy);
+
+      // lose: fell into the decoy pit's core
+      if (rf2 < (LEVEL.falsePit.R * 0.55) ** 2) {
+        finish('lose');
+      }
+      // win: at rest inside the target basin
+      else if (rt2 < (LEVEL.target.R * 0.5) ** 2 && speed < 0.45) {
+        state.settleFrames++;
+        if (state.settleFrames > 26) finish('win');
+      } else {
+        state.settleFrames = 0;
+      }
+    }
+    if (state.result === 'win') state.winGlow = Math.min(1, state.winGlow + 0.04);
+  }
+
+  function finish(res) {
+    if (state.result) return;
+    state.result = res;
+    const h1 = banner.querySelector('h1');
+    const p = banner.querySelector('p');
+    if (res === 'win') {
+      h1.textContent = '沈んだ';
+      p.innerHTML = '狙った谷へ導けた。 <kbd>R</kbd> でもう一度';
+      banner.className = 'win';
+    } else {
+      h1.textContent = '落ちた';
+      p.innerHTML = '偽の谷に呑まれた。 <kbd>R</kbd> でやり直し';
+      banner.className = 'lose';
+    }
+    banner.style.display = 'flex';
+  }
+
+  // ---- Render ---------------------------------------------------------------
+  function draw() {
+    ctx.drawImage(land, 0, 0);
+
+    // dynamic dent under cursor
+    if (state.mouse.down && state.mouse.inside && !state.result) {
+      const mx = state.mouse.x, my = state.mouse.y;
+      const grd = ctx.createRadialGradient(mx, my, 2, mx, my, R_DENT);
+      grd.addColorStop(0.0, 'rgba(120,180,255,0.42)');
+      grd.addColorStop(0.4, 'rgba(60,110,200,0.20)');
+      grd.addColorStop(1.0, 'rgba(60,110,200,0.0)');
+      ctx.fillStyle = grd;
+      ctx.beginPath(); ctx.arc(mx, my, R_DENT, 0, 7); ctx.fill();
+      // ripple rings
+      ctx.strokeStyle = 'rgba(150,200,255,0.28)';
+      ctx.lineWidth = 1.5;
+      for (let k = 1; k <= 3; k++) {
+        const rr = (R_DENT * 0.3) * k + (state.t % 40) / 40 * 14;
+        ctx.beginPath(); ctx.arc(mx, my, rr, 0, 7); ctx.stroke();
+      }
+    }
+
+    // target glow when won
+    if (state.winGlow > 0) {
+      const t = LEVEL.target;
+      const grd = ctx.createRadialGradient(t.x, t.y, 2, t.x, t.y, t.R);
+      grd.addColorStop(0, `rgba(180,255,200,${0.5 * state.winGlow})`);
+      grd.addColorStop(1, 'rgba(180,255,200,0)');
+      ctx.fillStyle = grd;
+      ctx.beginPath(); ctx.arc(t.x, t.y, t.R, 0, 7); ctx.fill();
+    }
+
+    // ball
+    const b = state.ball;
+    ctx.save();
+    // shadow
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.beginPath(); ctx.ellipse(b.x + 3, b.y + 5, 12, 9, 0, 0, 7); ctx.fill();
+    // body
+    const bg = ctx.createRadialGradient(b.x - 4, b.y - 5, 2, b.x, b.y, 13);
+    bg.addColorStop(0, '#fff8e8');
+    bg.addColorStop(0.5, '#ffd76a');
+    bg.addColorStop(1, '#e79a2a');
+    ctx.fillStyle = bg;
+    ctx.beginPath(); ctx.arc(b.x, b.y, 11, 0, 7); ctx.fill();
+    ctx.restore();
+
+    // cursor marker (crosshair) since we hide the OS cursor
+    if (state.mouse.inside && !state.result) {
+      ctx.strokeStyle = 'rgba(200,225,255,0.7)';
+      ctx.lineWidth = 1.4;
+      const mx = state.mouse.x, my = state.mouse.y;
+      ctx.beginPath();
+      ctx.moveTo(mx - 9, my); ctx.lineTo(mx - 3, my);
+      ctx.moveTo(mx + 3, my); ctx.lineTo(mx + 9, my);
+      ctx.moveTo(mx, my - 9); ctx.lineTo(mx, my - 3);
+      ctx.moveTo(mx, my + 3); ctx.lineTo(mx, my + 9);
+      ctx.stroke();
+    }
+
+    const sp = Math.hypot(b.vx, b.vy).toFixed(2);
+    hud.innerHTML = `谷を掘って転がす<br><b>緑の谷</b>へ球を沈める &nbsp; <span style="color:#ff9a8a">赤い穴</span>は落とし穴<br>速さ ${sp}`;
+  }
+
+  let running = true;
+  function loop() {
+    if (running) step();
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // ---- Input ----------------------------------------------------------------
+  function toLocal(e) {
+    const r = cv.getBoundingClientRect();
+    return {
+      x: (e.clientX - r.left) * (W / r.width),
+      y: (e.clientY - r.top) * (H / r.height),
+    };
+  }
+  cv.addEventListener('mousemove', e => {
+    const p = toLocal(e);
+    state.mouse.x = p.x; state.mouse.y = p.y; state.mouse.inside = true;
+  });
+  cv.addEventListener('mouseleave', () => { state.mouse.inside = false; });
+  cv.addEventListener('mouseenter', () => { state.mouse.inside = true; });
+  cv.addEventListener('mousedown', e => { e.preventDefault(); state.mouse.down = true; });
+  window.addEventListener('mouseup', () => { state.mouse.down = false; });
+  // touch
+  cv.addEventListener('touchstart', e => {
+    e.preventDefault(); const p = toLocal(e.touches[0]);
+    state.mouse.x = p.x; state.mouse.y = p.y; state.mouse.inside = true; state.mouse.down = true;
+  }, { passive: false });
+  cv.addEventListener('touchmove', e => {
+    e.preventDefault(); const p = toLocal(e.touches[0]);
+    state.mouse.x = p.x; state.mouse.y = p.y;
+  }, { passive: false });
+  window.addEventListener('touchend', () => { state.mouse.down = false; });
+  window.addEventListener('keydown', e => { if (e.key === 'r' || e.key === 'R') reset(); });
+
+  // expose a tiny hook so an automated harness can drive & inspect the game
+  window.__game = { state, LEVEL, reset, step,
+    pause(){ running = false; }, resume(){ running = true; },
+    press(x, y){ state.mouse.x=x; state.mouse.y=y; state.mouse.inside=true; state.mouse.down=true; },
+    release(){ state.mouse.down=false; },
+    move(x,y){ state.mouse.x=x; state.mouse.y=y; state.mouse.inside=true; },
+  };
+
+  reset();
+  loop();
+})();
+</script>
+</body>
+</html>
